@@ -79,7 +79,7 @@ def objective_function(w_flat, metadata, mlp_model, X, y):
 
 class MLP:
     def __init__(self, layer_sizes, activation='sigmoid', lambda_reg=0.0):
-        self.layer_sizes = layer_sizes      # e.g. [D, 64, 32, 1]
+        self.layer_sizes = layer_sizes
         self.lambda_reg = lambda_reg
         self.activation_name = activation
         self.params = self.initialize_weights()
@@ -100,7 +100,7 @@ class MLP:
                 ...
             }
         """
-        np.random.seed(0)  # For reproducibility
+        np.random.seed(42)  # For reproducibility
         params = {}
         for i in range(1, len(self.layer_sizes)):
             input_size = self.layer_sizes[i - 1]
