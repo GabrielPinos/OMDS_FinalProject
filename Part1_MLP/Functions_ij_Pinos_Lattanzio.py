@@ -3,25 +3,38 @@ from sklearn.model_selection import KFold
 import time
 from scipy.optimize import minimize
 
-def flatten_params(params):
+def flatten_params(params, metadata=None):
     """
-    Flattens the param dict {W0, b0, W1, b1, ...} into a 1D array,
-    and records each variable's shape and name.
+    Flattens the parameter dictionary into a 1D vector.
+
+    If metadata is provided, flattens the parameters in the same order.
+
+    Args:
+        params: Dict of parameters (e.g., {"W0": ..., "b0": ...})
+        metadata: Optional list of (key, shape, size) to preserve order
 
     Returns:
-        - flat_params: concatenated 1D array
-        - metadata: list of (key, shape, size)
+        flat_array: 1D numpy array
+        metadata: if not provided, returns generated metadata
     """
     flat_list = []
-    metadata = []
+    generated_metadata = []
 
-    for key, value in params.items():
-        flat_value = value.ravel()
-        flat_list.append(flat_value)
-        metadata.append((key, value.shape, flat_value.size))
+    if metadata is None:
+        for key, value in params.items():
+            flat_value = value.ravel()
+            flat_list.append(flat_value)
+            generated_metadata.append((key, value.shape, flat_value.size))
+        flat_array = np.concatenate(flat_list)
+        return flat_array, generated_metadata
+    else:
+        for key, shape, size in metadata:
+            flat_value = params[key].ravel()
+            flat_list.append(flat_value)
+        flat_array = np.concatenate(flat_list)
+        return flat_array, metadata
 
-    flat_params = np.concatenate(flat_list)
-    return flat_params, metadata
+
 
 def unflatten_params(flat_array, metadata):
     """
@@ -72,7 +85,7 @@ def objective_function(w_flat, metadata, mlp_model, X, y):
     grads = mlp_model.backward(X, y)
 
     # 5. Flatten gradients to return to optimizer
-    grad_flat, _ = flatten_params(grads)
+    grad_flat, _ = flatten_params(grads, metadata)
 
     return loss, grad_flat
 
@@ -86,34 +99,24 @@ class MLP:
     
     def initialize_weights(self):
         """
-        Initialize weights and biases for all layers using Xavier initialization.
-
-        For each layer l:
-            - Weight matrix W[l] ∈ ℝ^{n_l x n_{l-1}} initialized with N(0, 1/n_{l-1})
-            - Bias vector b[l] initialized as zeros
-
-        Returns:
-            A dictionary containing all initialized weights and biases:
-            {
-                "W0": ..., "b0": ...,
-                "W1": ..., "b1": ...,
-                ...
-            }
+        Initialize weights and biases with small Gaussian noise (mean 0, std 0.01).
         """
-        np.random.seed(42)  # For reproducibility
+        np.random.seed(42)
         params = {}
         for i in range(1, len(self.layer_sizes)):
             input_size = self.layer_sizes[i - 1]
             output_size = self.layer_sizes[i]
-            
-            #  Initialization : : preserves variance of signals
-            weight = np.random.randn(output_size, input_size) * np.sqrt(1 / input_size)
+
+            # Simple init: small values
+            weight = np.random.randn(output_size, input_size) * 0.01
             bias = np.zeros((output_size, 1))
-            
+
             params[f"W{i-1}"] = weight
             params[f"b{i-1}"] = bias
-            
+
         return params
+
+            # weight = np.random.randn(output_size, input_size) * np.sqrt(1 / input_size)
 
     def activation(self, x):
         """
@@ -190,29 +193,34 @@ class MLP:
         return a  # final output (predictions)
 
     
-    def compute_loss(self, y_true, y_pred):
+    def compute_loss(self, y_true, y_pred, verbose=False):
         """
         Computes the L2-regularized Mean Squared Error loss.
 
         Args:
             y_true: Ground truth target values (shape: n_samples,)
-            y_pred: Predicted values (shape: 1 × n_samples)
+            y_pred: Predicted values (shape: 1 x n_samples)
+            verbose: If True, prints detailed loss components
 
         Returns:
-            Scalar value of the loss
+            Scalar value of the loss (MSE + regularization)
         """
         m = y_true.shape[0]
-        error = y_pred.flatten() - y_true  # (n_samples,)
+        error = y_pred.flatten() - y_true
         mse = np.mean(error ** 2)
 
-        # L2 regularization (only on weights, not biases)
         l2_penalty = 0
         for key in self.params:
             if key.startswith("W"):
                 l2_penalty += np.sum(self.params[key] ** 2)
 
         loss = mse + self.lambda_reg * l2_penalty
+
+        if verbose:
+            print(f"[LOSS DEBUG] MSE: {mse:.6f}, L2 penalty: {self.lambda_reg * l2_penalty:.6f}, Total loss: {loss:.6f}")
+
         return loss
+
 
     
     def backward(self, X, y):
@@ -242,8 +250,9 @@ class MLP:
             dW = np.dot(dz, a_prev.T) + self.lambda_reg * W  # gradient + L2
             db = np.sum(dz, axis=1, keepdims=True)
 
-            grads[f"dW{i}"] = dW
-            grads[f"db{i}"] = db
+            grads[f"W{i}"] = dW
+            grads[f"b{i}"] = db
+
 
             if i != 0:
                 z_prev = self.z_list[i - 1]
@@ -301,28 +310,29 @@ def train_model(X, y, layer_sizes, activation='tanh', lambda_reg=1e-3, max_iter=
 
     # 4. Run optimizer
     start_time = time.time()
-    result = minimize(
+    opt_result = minimize(
         fun=wrapped_objective,
         x0=w0,
         method='L-BFGS-B',
-        jac=True,                   # we return loss and grad
-        options={'maxiter': max_iter}
+        jac=True,
+        options={'maxiter': max_iter, 'disp': False}
     )
+
     end_time = time.time()
 
     # 5. Update model with final weights
-    final_params = unflatten_params(result.x, metadata)
+    final_params = unflatten_params(opt_result.x, metadata)
     model.params = final_params
 
     training_time = end_time - start_time
 
-    return model, result, training_time
+    return model, opt_result, training_time
 
 
 
 
 
-def cross_validate_model(X, y, k_folds, configs, max_iter=200, seed=42, scoring='mse'):
+def cross_validate_model(X, y, k_folds, configs, max_iter=200, seed=42, scoring='mse', verbose =False):
     """
     Performs k-fold cross-validation to evaluate different MLP configurations,
     with normalization of the target variable inside each fold.
@@ -373,7 +383,8 @@ def cross_validate_model(X, y, k_folds, configs, max_iter=200, seed=42, scoring=
             if scoring == 'mse':
                 err = np.mean((y_val_pred - y_val) ** 2)
             elif scoring == 'mape':
-                err = np.mean(np.abs((y_val - y_val_pred) / y_val)) * 100
+                err = np.mean(np.abs((y_val - y_val_pred) / (y_val + 1e-8))) * 100
+            # using a small epsilon to avoid division by zero
             else:
                 raise ValueError("Unsupported scoring")
 
@@ -381,8 +392,18 @@ def cross_validate_model(X, y, k_folds, configs, max_iter=200, seed=42, scoring=
 
         avg_val_error = np.mean(val_errors)
         results.append((config, avg_val_error))
-        print(f"Config: {config} → Avg Val {scoring.upper()}: {avg_val_error:.4f}")
+        if verbose:
+            print(f"Config: {config} → Avg Val {scoring.upper()}: {avg_val_error:.4f}")
+
 
     # Select best config based on lowest avg val error
     best_config, best_score = min(results, key=lambda x: x[1])
+    if verbose:
+        print("\n=== BEST CONFIGURATION ===")
+        print(f"Layers: {best_config['layers']}")
+        print(f"Activation: {best_config['activation']}")
+        print(f"Lambda: {best_config['lambda']}")
+        print(f"Best Val {scoring.upper()}: {best_score:.4f}")
+
     return best_config, results, best_score
+
