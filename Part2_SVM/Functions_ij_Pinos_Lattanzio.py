@@ -1,491 +1,230 @@
 import numpy as np
-from sklearn.model_selection import KFold
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix , accuracy_score
+from cvxopt import matrix, solvers
 import time
-from scipy.optimize import minimize
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 
-def flatten_params(params):
+def linear_kernel(X1, X2):
     """
-    Flattens the param dict {W0, b0, W1, b1, ...} into a 1D array,
-    and records each variable's shape and name.
+    Computes the linear kernel K(x, x') = x · x'
+    
+    Args:
+        X1: shape (n_samples_1, n_features)
+        X2: shape (n_samples_2, n_features)
 
     Returns:
-        - flat_params: concatenated 1D array
-        - metadata: list of (key, shape, size)
+        Kernel matrix of shape (n_samples_1, n_samples_2)
     """
-    flat_list = []
-    metadata = []
+    return np.dot(X1, X2.T)
 
-    for key, value in params.items():
-        flat_value = value.ravel()
-        flat_list.append(flat_value)
-        metadata.append((key, value.shape, flat_value.size))
 
-    flat_params = np.concatenate(flat_list)
-    return flat_params, metadata
-
-def unflatten_params(flat_array, metadata):
+def polynomial_kernel(X1, X2, p=3):
     """
-    Reconstructs the original param dict from the flat array and metadata.
+    Computes the polynomial kernel K(x, x') = (x · x' + 1)^p
+    
+    Args:
+        X1: shape (n_samples_1, n_features)
+        X2: shape (n_samples_2, n_features)
+        p: degree of the polynomial
+
+    Returns:
+        Kernel matrix of shape (n_samples_1, n_samples_2)
+    """
+    return (np.dot(X1, X2.T) + 1) ** p
+
+
+def rbf_kernel(X1, X2, gamma=0.1):
+    """
+    Computes the RBF (Gaussian) kernel:
+    K(x, x') = exp(-gamma ||x - x'||^2)
 
     Args:
-        flat_array: 1D numpy array with all params
-        metadata: list of (key, shape, size) as returned by flatten_params
+        X1: shape (n_samples_1, n_features)
+        X2: shape (n_samples_2, n_features)
+        gamma: width of the Gaussian (scalar)
 
     Returns:
-        Dictionary with reshaped weight/bias matrices
+        Kernel matrix of shape (n_samples_1, n_samples_2)
     """
-    params = {}
-    index = 0
-    for key, shape, size in metadata:
-        param = flat_array[index : index + size].reshape(shape)
-        params[key] = param
-        index += size
+    # Expand dimensions for broadcasting
+    X1_sq = np.sum(X1**2, axis=1).reshape(-1, 1)
+    X2_sq = np.sum(X2**2, axis=1).reshape(1, -1)
+    sq_dist = X1_sq + X2_sq - 2 * np.dot(X1, X2.T)
+    return np.exp(-gamma * sq_dist)
 
-    return params
-
-def objective_function(w_flat, metadata, mlp_model, X, y):
+def compute_kernel_matrix(X1, X2, kernel_function):
     """
-    Computes the loss and gradient for scipy.optimize.minimize.
+    Computes the kernel matrix between two datasets using a specified kernel function.
 
     Args:
-        w_flat: Flattened parameter vector
-        metadata: Shapes and names of original parameters
-        mlp_model: MLP model instance
-        X: Input data (n_samples × n_features)
-        y: Target values (n_samples,)
+        X1: shape (n_samples_1, n_features)
+        X2: shape (n_samples_2, n_features)
+        kernel_function: callable (e.g., linear_kernel, rbf_kernel, etc.)
 
     Returns:
-        loss: Scalar loss value
-        grad_flat: Flattened gradient vector
+        Kernel matrix K of shape (n_samples_1, n_samples_2)
     """
-    # 1. Reconstruct parameter dictionary from flat vector
-    params = unflatten_params(w_flat, metadata)
-    mlp_model.params = params  # update model with current weights
-
-    # 2. Forward pass to compute predictions
-    y_pred = mlp_model.forward(X)
-
-    # 3. Compute loss (MSE + L2)
-    loss = mlp_model.compute_loss(y, y_pred)
-
-    # 4. Backward pass to compute gradients
-    grads = mlp_model.backward(X, y)
-
-    # 5. Flatten gradients to return to optimizer
-    grad_flat, _ = flatten_params(grads)
-
-    return loss, grad_flat
+    return kernel_function(X1, X2)
 
 
-class MLP:
-    def __init__(self, layer_sizes, activation='relu', lambda_reg=0.0, dropout_rate=0.0):
-        self.layer_sizes = layer_sizes
-        self.lambda_reg = lambda_reg
-        self.activation_name = activation
-        self.dropout_rate = dropout_rate
-        self.training = True  # Training mode flag for dropout
-        self.params = self.initialize_weights()
-    
-    def initialize_weights(self):
-        """
-        Initialize weights and biases for all layers using improved initialization.
-        
-        Uses:
-        - He initialization for ReLU/LeakyReLU
-        - Xavier initialization for sigmoid/tanh
-        - Small random initialization for biases
 
-        Returns:
-            A dictionary containing all initialized weights and biases
-        """
-        np.random.seed(42)  # Better seed for reproducibility
-        params = {}
-        
-        for i in range(1, len(self.layer_sizes)):
-            input_size = self.layer_sizes[i - 1]
-            output_size = self.layer_sizes[i]
-            
-            # Choose initialization based on activation function
-            if self.activation_name in ['relu']:
-                # He initialization for ReLU variants
-                std = np.sqrt(2.0 / input_size)
-            else:
-                # Xavier initialization for sigmoid/tanh
-                std = np.sqrt(1.0 / input_size)
-            
-            weight = np.random.randn(output_size, input_size) * std
-            # Small random bias initialization instead of zeros
-            bias = np.random.randn(output_size, 1) * 0.01
-            
-            params[f"W{i-1}"] = weight
-            params[f"b{i-1}"] = bias
-            
-        return params
+def train_svm_dual_cvxopt(X, y, kernel, C=1.0, tol=1e-5):
+    n_samples = X.shape[0]
+    y = y.astype(float)
 
-    def activation(self, x):
-        """
-        Applies the chosen activation function element-wise with numerical stability.
-        """
-        if self.activation_name == 'sigmoid':
-            # Numerically stable sigmoid
-            return np.where(x >= 0, 
-                          1 / (1 + np.exp(-x)), 
-                          np.exp(x) / (1 + np.exp(x)))
-        elif self.activation_name == 'tanh':
-            return np.tanh(x)
-        elif self.activation_name == 'relu':
-            return np.maximum(0, x)
-        else:
-            raise ValueError("Unsupported activation function: choose 'sigmoid', 'tanh', 'relu'")
+    # Kernel + QP matrices (double + P simmetrico)
+    K = compute_kernel_matrix(X, X, kernel)
+    P_np = (np.outer(y, y) * K).astype('double')
+    P_np = 0.5 * (P_np + P_np.T)  # simmetrizza
+    q_np = (-np.ones(n_samples)).astype('double')
 
-    def activation_derivative(self, x):
-        """
-        Computes the derivative of the chosen activation function with numerical stability.
-        """
-        if self.activation_name == 'sigmoid':
-            sig = self.activation(x)
-            return sig * (1 - sig)
-        elif self.activation_name == 'tanh':
-            return 1 - np.tanh(x) ** 2
-        elif self.activation_name == 'relu':
-            return (x > 0).astype(float)
+    G_std = (-np.eye(n_samples)).astype('double')
+    h_std = (np.zeros(n_samples)).astype('double')
+    G_slack = (np.eye(n_samples)).astype('double')
+    h_slack = (C * np.ones(n_samples)).astype('double')
 
-        else:
-            raise ValueError("Unsupported activation function")
+    G_np = np.vstack((G_std, G_slack))
+    h_np = np.hstack((h_std, h_slack))
 
-    def apply_dropout(self, a):
-        """Apply dropout during training"""
-        if self.training and self.dropout_rate > 0:
-            mask = np.random.binomial(1, 1 - self.dropout_rate, size=a.shape) / (1 - self.dropout_rate)
-            return a * mask
-        return a
+    A_np = y.reshape(1, -1).astype('double')
+    b_np = np.array([0.0], dtype='double')
 
-    def forward(self, X):
-        """
-        Performs the forward pass of the MLP with improved numerical stability.
-        """
-        a = X.T  # Each column is a sample
-        self.z_list = []
-        self.a_list = [a]  # First activation is the input
+    P, q = matrix(P_np), matrix(q_np)
+    G, h = matrix(G_np), matrix(h_np)
+    A, b_cvx = matrix(A_np), matrix(b_np)
 
-        num_layers = len(self.layer_sizes) - 1  # Exclude input layer
+    solvers.options['show_progress'] = False
+    t0 = time.perf_counter()
+    result = solvers.qp(P, q, G, h, A, b_cvx)
+    opt_time = time.perf_counter() - t0
 
-        for i in range(num_layers):
-            W = self.params[f"W{i}"]
-            b = self.params[f"b{i}"]
-            
-            # Apply dropout to previous layer's activations (except input)
-            if i > 0:
-                a = self.apply_dropout(a)
-            
-            z = np.dot(W, a) + b  # pre-activation
-            self.z_list.append(z)
+    alpha = np.ravel(result['x'])
+    # clamp numerico
+    alpha = np.clip(alpha, 0.0, C)
 
-            # Apply activation for hidden layers only
-            if i < num_layers - 1:
-                a = self.activation(z)
-            else:
-                a = z  # Linear output for regression
+    obj = result['primal objective']
+    n_iter = result['iterations']
+    status = result['status']  # 'optimal', ecc.
 
-            self.a_list.append(a)
+    # indici SV e FREE SV
+    sv_idx = np.where(alpha > tol)[0]
+    free_idx = np.where((alpha > tol) & (alpha < C - tol))[0]
+    idx_for_b = free_idx if len(free_idx) > 0 else sv_idx
 
-        return a  # final output (predictions)
+    # bias su FREE SV (fallback: tutti gli SV)
+    b = np.mean([
+        y[i] - np.sum(alpha * y * K[i])
+        for i in idx_for_b
+    ])
 
-    def compute_loss(self, y_true, y_pred):
-        """
-        Computes the L2-regularized Mean Squared Error loss with improved regularization.
-        """
-        m = y_true.shape[0]
-        error = y_pred.flatten() - y_true  # (n_samples,)
-        mse = np.mean(error ** 2)
-
-        # Improved L2 regularization (only on weights, not biases)
-        # Scale regularization by number of parameters to make it more interpretable
-        l2_penalty = 0
-        total_params = 0
-        for key in self.params:
-            if key.startswith("W"):
-                weight_matrix = self.params[key]
-                l2_penalty += np.sum(weight_matrix ** 2)
-                total_params += weight_matrix.size
-
-        # Normalize regularization by total number of parameters
-        if total_params > 0:
-            l2_penalty = l2_penalty / total_params
-
-        loss = mse + self.lambda_reg * l2_penalty
-        return loss
-
-    def backward(self, X, y):
-        """
-        Performs backpropagation with improved gradient computation.
-        """
-        m = y.shape[0]
-        y = y.reshape(1, -1)  # Shape: (1, n_samples)
-        grads = {}
-
-        # Initialize gradient from output layer
-        a_final = self.a_list[-1]  # Output predictions
-        dz = (a_final - y) / m  # Derivative of MSE w.r.t. output z (removed factor of 2)
-
-        for i in reversed(range(len(self.layer_sizes) - 1)):
-            a_prev = self.a_list[i]
-            W = self.params[f"W{i}"]
-
-            # Improved gradient computation with proper regularization scaling
-            total_params = sum(p.size for key, p in self.params.items() if key.startswith("W"))
-            reg_term = (self.lambda_reg / total_params) * W if total_params > 0 else 0
-            
-            dW = np.dot(dz, a_prev.T) + reg_term
-            db = np.sum(dz, axis=1, keepdims=True)
-
-            grads[f"dW{i}"] = dW
-            grads[f"db{i}"] = db
-
-            if i != 0:
-                z_prev = self.z_list[i - 1]
-                da = np.dot(W.T, dz)
-                dz = da * self.activation_derivative(z_prev)  # chain rule
-
-        return grads
-
-    def predict(self, X):
-        """
-        Runs a forward pass through the network and returns predicted outputs.
-        Sets training mode to False to disable dropout during prediction.
-        """
-        original_training = self.training
-        self.training = False  # Disable dropout for prediction
-        
-        output = self.forward(X)  # forward already transposes input
-        result = output.flatten()   # convert from (1, n_samples) to (n_samples,)
-        
-        self.training = original_training  # Restore original training mode
-        return result
+    return alpha, sv_idx, b, obj, n_iter, status, opt_time
 
 
-def train_model(X, y, layer_sizes, activation='relu', lambda_reg=1e-3, dropout_rate=0.0, 
-                max_iter=500, method='L-BFGS-B'):
+
+
+def predict_svm_dual(X_train, y_train, X_test, alpha, b, kernel, tol=1e-5):
     """
-    Trains an MLP using scipy.optimize.minimize with improved settings.
+    Predict labels for test points using the trained SVM dual solution.
+
+    Args:
+        X_train: training data (used to define support vectors)
+        y_train: training labels
+        X_test: test data
+        alpha: vector of Lagrange multipliers
+        b: bias term
+        kernel: kernel function
+        tol: threshold for selecting support vectors (usually same as in training)
+
+    Returns:
+        predictions: array of predicted labels (+1 or -1)
     """
-    # 1. Initialize model
-    model = MLP(layer_sizes, activation=activation, lambda_reg=lambda_reg, dropout_rate=dropout_rate)
+    support_indices = np.where(alpha > tol)[0]
+    alpha_sv = alpha[support_indices]
+    y_sv = y_train[support_indices]
+    X_sv = X_train[support_indices]
 
-    # 2. Flatten initial weights and get metadata
-    w0, metadata = flatten_params(model.params)
-
-    # 3. Define objective function with fixed args
-    def wrapped_objective(w_flat):
-        return objective_function(w_flat, metadata, model, X, y)
-
-    # 4. Run optimizer with improved settings
-    start_time = time.time()
-    
-    optimizer_options = {
-        'maxiter': max_iter,
-        'ftol': 1e-9,    # Tighter convergence tolerance
-        'gtol': 1e-8,    # Gradient tolerance
-    }
-    
-    result = minimize(
-        fun=wrapped_objective,
-        x0=w0,
-        method=method,
-        jac=True,                   # we return loss and grad
-        options=optimizer_options
-    )
-    end_time = time.time()
-
-    # 5. Update model with final weights
-    final_params = unflatten_params(result.x, metadata)
-    model.params = final_params
-
-    training_time = end_time - start_time
-
-    return model, result, training_time
+    K = compute_kernel_matrix(X_test, X_sv, kernel)
+    decision = K @ (alpha_sv * y_sv) + b
+    pred = np.sign(decision)
+    pred[pred == 0] = 1
+    return pred
 
 
-def cross_validate_model(X, y, k_folds, configs, max_iter=500, seed=42, scoring='mse'):
+
+def cross_validate_svm_cvxopt(X, y, C_values, gamma_values, k_folds=5):
     """
-    Performs k-fold cross-validation that matches your existing workflow.
-    Note: X should already be scaled (as in your notebook workflow).
+    Cross-validation using CVXOPT for RBF kernel SVM.
+
+    Returns:
+        best_config: tuple (C, gamma, avg_val_accuracy)
+        all_results: list of tuples with (C, gamma, avg_val_accuracy)
     """
-    kf = KFold(n_splits=k_folds, shuffle=True, random_state=seed)
-    results = []
+    skf = StratifiedKFold(n_splits=k_folds, shuffle=True, random_state=42)
+    all_results = []
 
-    print(f"Starting {k_folds}-fold cross-validation with {len(configs)} configurations...")
-    
-    for config_idx, config in enumerate(configs):
-        print(f"\nTesting config {config_idx + 1}/{len(configs)}: {config}")
-        val_errors = []
-        fold_times = []
+    for C in C_values:
+        for gamma in gamma_values:
+            accs = []
+            for tr_idx, va_idx in skf.split(X, y):
+                X_tr, X_va = X[tr_idx], X[va_idx]
+                y_tr, y_va = y[tr_idx], y[va_idx]
 
-        for fold_idx, (train_idx, val_idx) in enumerate(kf.split(X)):
-            fold_start = time.time()
-            
-            X_train, X_val = X[train_idx], X[val_idx]
-            y_train, y_val = y[train_idx], y[val_idx]
+                scaler = StandardScaler()
+                X_tr = scaler.fit_transform(X_tr)
+                X_va = scaler.transform(X_va)
 
-            # Target normalization (same as your workflow)
-            y_min, y_max = y_train.min(), y_train.max()
-            y_range = y_max - y_min
-            if y_range == 0:
-                y_range = 1  # Avoid division by zero
-            
-            y_train_norm = (y_train - y_min) / y_range
-
-            # Train model on normalized data
-            try:
-                model, result, train_time = train_model(
-                    X_train, y_train_norm,
-                    layer_sizes=config['layers'],
-                    activation=config['activation'],
-                    lambda_reg=config['lambda'],
-                    dropout_rate=config.get('dropout', 0.0),
-                    max_iter=max_iter
+                kernel = lambda A, B: rbf_kernel(A, B, gamma=gamma)
+                alpha, sv_idx, b, obj, iters, status, _ = train_svm_dual_cvxopt(
+                    X_tr, y_tr, kernel, C
                 )
+                y_pred = predict_svm_dual(X_tr, y_tr, X_va, alpha, b, kernel)
+                accs.append(accuracy_score(y_va, y_pred))
 
-                # Predict and denormalize output
-                y_val_pred_norm = model.predict(X_val)
-                y_val_pred = y_val_pred_norm * y_range + y_min
+            avg_acc = float(np.mean(accs))
+            print(f"C={C}, gamma={gamma} → avg val acc: {avg_acc:.4f}")
+            all_results.append((C, gamma, avg_acc))
 
-                # Compute validation error
-                if scoring == 'mse':
-                    err = np.mean((y_val_pred - y_val) ** 2)
-                elif scoring == 'mape':
-                    # Avoid division by zero in MAPE
-                    mask = np.abs(y_val) > 0.1  # Only consider non-zero targets
-                    if np.sum(mask) > 0:
-                        err = np.mean(np.abs((y_val[mask] - y_val_pred[mask]) / y_val[mask])) * 100
-                    else:
-                        err = float('inf')
-                else:
-                    raise ValueError("Unsupported scoring method")
-
-                val_errors.append(err)
-                fold_times.append(time.time() - fold_start)
-                
-                print(f"  Fold {fold_idx + 1}: {scoring.upper()} = {err:.4f}, "
-                      f"Train time = {train_time:.2f}s, Converged = {result.success}")
-                
-            except Exception as e:
-                print(f"  Fold {fold_idx + 1}: Error during training - {str(e)}")
-                val_errors.append(float('inf'))
-                fold_times.append(time.time() - fold_start)
-
-        if val_errors:
-            # Filter out infinite errors for average calculation
-            valid_errors = [e for e in val_errors if not np.isinf(e)]
-            if valid_errors:
-                avg_val_error = np.mean(valid_errors)
-                std_val_error = np.std(valid_errors)
-                avg_time = np.mean(fold_times)
-            else:
-                avg_val_error = float('inf')
-                std_val_error = 0
-                avg_time = np.mean(fold_times)
-        else:
-            avg_val_error = float('inf')
-            std_val_error = 0
-            avg_time = 0
-
-        results.append((config, avg_val_error, std_val_error))
-        print(f"  Average {scoring.upper()}: {avg_val_error:.4f} ± {std_val_error:.4f}, "
-              f"Avg time per fold: {avg_time:.2f}s")
-
-    # Select best config based on lowest avg val error
-    valid_results = [(c, e, s) for c, e, s in results if not np.isinf(e)]
-    if valid_results:
-        best_config, best_score, best_std = min(valid_results, key=lambda x: x[1])
-        print(f"\nBest configuration: {best_config}")
-        print(f"Best {scoring.upper()}: {best_score:.4f} ± {best_std:.4f}")
-    else:
-        print("\nNo valid configurations found!")
-        best_config, best_score = None, float('inf')
-
-    # Return format matching your original function
-    return best_config, results
+    best_config = max(all_results, key=lambda x: x[2])
+    return best_config, all_results
 
 
-def evaluate_model(model, X, y, scaler=None, y_normalizer=None, dataset_name="Dataset"):
+
+def evaluate_svm_all(X_train, y_train, X_test, y_test, alpha, b, kernel, threshold=1e-5):
     """
-    Evaluate model performance with proper scaling and denormalization.
-    
-    Args:
-        model: Trained MLP model
-        X: Input features
-        y: True targets
-        scaler: Fitted StandardScaler for features (optional)
-        y_normalizer: Dict with 'min' and 'range' for target denormalization (optional)
-        dataset_name: Name for printing results
-    
-    Returns:
-        dict: Dictionary containing MSE and MAPE scores
+    Full evaluation of SVM model: accuracy + confusion matrices + support vectors.
     """
-    # Scale features if scaler provided
-    if scaler is not None:
-        X_scaled = scaler.transform(X)
-    else:
-        X_scaled = X
-    
-    # Get predictions
-    y_pred_norm = model.predict(X_scaled)
-    
-    # Denormalize predictions if normalizer provided
-    if y_normalizer is not None:
-        y_pred = y_pred_norm * y_normalizer['range'] + y_normalizer['min']
-    else:
-        y_pred = y_pred_norm
-    
-    # Calculate metrics
-    mse = np.mean((y_pred - y) ** 2)
-    
-    # MAPE calculation with zero-handling
-    mask = np.abs(y) > 0.1
-    if np.sum(mask) > 0:
-        mape = np.mean(np.abs((y[mask] - y_pred[mask]) / y[mask])) * 100
-    else:
-        mape = float('inf')
-    
-    print(f"{dataset_name} Results:")
-    print(f"  MSE: {mse:.4f}")
-    print(f"  MAPE: {mape:.2f}%")
-    
-    return {'mse': mse, 'mape': mape, 'predictions': y_pred}
+    support_indices = np.where(alpha > threshold)[0]
+    n_sv = len(support_indices)
+    percent_sv = 100 * n_sv / len(alpha)
+
+    y_train_pred = predict_svm_dual(X_train, y_train, X_train, alpha, b, kernel)
+    y_test_pred  = predict_svm_dual(X_train, y_train, X_test, alpha, b, kernel)
+
+    acc_train = accuracy_score(y_train, y_train_pred)
+    acc_test  = accuracy_score(y_test, y_test_pred)
+
+    cm_train = confusion_matrix(y_train, y_train_pred)
+    cm_test  = confusion_matrix(y_test, y_test_pred)
+
+    print("\n--- FULL SVM EVALUATION ---")
+    print(f"Train Accuracy         : {acc_train:.4f}")
+    print(f"Test Accuracy          : {acc_test:.4f}")
+    print(f"Support Vectors        : {n_sv} / {len(alpha)} ({percent_sv:.2f}%)")
+    print("Confusion Matrix (Train):")
+    print(cm_train)
+    print("Confusion Matrix (Test):")
+    print(cm_test)
+
+    return {
+        "train_accuracy": acc_train,
+        "test_accuracy": acc_test,
+        "n_support_vectors": n_sv,
+        "percent_support_vectors": percent_sv,
+        "confusion_matrix_train": cm_train,
+        "confusion_matrix_test": cm_test
+    }
 
 
-# Example usage and improved hyperparameter configurations
-def get_improved_configs():
-    """
-    Returns a set of improved hyperparameter configurations for age prediction.
-    """
-    configs = []
-    
-    # Define base architectures (assuming input size will be added dynamically)
-    architectures = [
-        [128, 64, 1],           # Medium network
-        [256, 128, 64, 1],      # Deeper network
-        [512, 256, 128, 1],     # Even deeper
-        [256, 256, 128, 1],     # Wider hidden layers
-        [128, 128, 64, 32, 1],  # More layers
-    ]
-    
-    activations = ['relu', 'tanh']
-    lambda_values = [1e-5, 1e-4, 1e-3, 1e-2]
-    dropout_values = [0.0, 0.1, 0.2]
-    
-    # Generate combinations (limited to avoid too many configs)
-    for arch in architectures[:3]:  # Test top 3 architectures
-        for activation in activations:
-            for lambda_reg in lambda_values:
-                for dropout in dropout_values[:2]:  # Test 2 dropout values
-                    configs.append({
-                        'layers': arch,  # Will be updated with input size
-                        'activation': activation,
-                        'lambda': lambda_reg,
-                        'dropout': dropout
-                    })
-    
-    return configs[:24]  # Limit to reasonable number for testing
+
+
