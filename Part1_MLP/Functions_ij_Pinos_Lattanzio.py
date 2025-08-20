@@ -247,7 +247,7 @@ class MLP:
             a_prev = self.a_list[i]
             W = self.params[f"W{i}"]
 
-            dW = np.dot(dz, a_prev.T) + self.lambda_reg * W  # gradient + L2
+            dW = np.dot(dz, a_prev.T) + 2 * self.lambda_reg * W  # gradient + L2
             db = np.sum(dz, axis=1, keepdims=True)
 
             grads[f"W{i}"] = dW

@@ -73,10 +73,9 @@ def train_svm_dual_cvxopt(X, y, kernel, C=1.0, tol=1e-5):
     n_samples = X.shape[0]
     y = y.astype(float)
 
-    # Kernel + QP matrices (double + P simmetrico)
     K = compute_kernel_matrix(X, X, kernel)
     P_np = (np.outer(y, y) * K).astype('double')
-    P_np = 0.5 * (P_np + P_np.T)  # simmetrizza
+    P_np = 0.5 * (P_np + P_np.T)
     q_np = (-np.ones(n_samples)).astype('double')
 
     G_std = (-np.eye(n_samples)).astype('double')
@@ -100,19 +99,16 @@ def train_svm_dual_cvxopt(X, y, kernel, C=1.0, tol=1e-5):
     opt_time = time.perf_counter() - t0
 
     alpha = np.ravel(result['x'])
-    # clamp numerico
     alpha = np.clip(alpha, 0.0, C)
 
     obj = result['primal objective']
     n_iter = result['iterations']
-    status = result['status']  # 'optimal', ecc.
+    status = result['status']
 
-    # indici SV e FREE SV
     sv_idx = np.where(alpha > tol)[0]
     free_idx = np.where((alpha > tol) & (alpha < C - tol))[0]
     idx_for_b = free_idx if len(free_idx) > 0 else sv_idx
 
-    # bias su FREE SV (fallback: tutti gli SV)
     b = np.mean([
         y[i] - np.sum(alpha * y * K[i])
         for i in idx_for_b
@@ -228,3 +224,52 @@ def evaluate_svm_all(X_train, y_train, X_test, y_test, alpha, b, kernel, thresho
 
 
 
+
+def decision_function_svm_dual(X_train, y_train, X_test, alpha, b, kernel, tol=1e-5):
+    """
+    Restituisce i punteggi (decision values) del SVM binario:
+    f(x) = sum_i alpha_i * y_i * K(x, x_i) + b
+    """
+    support_indices = np.where(alpha > tol)[0]
+    alpha_sv = alpha[support_indices]
+    y_sv = y_train[support_indices]
+    X_sv = X_train[support_indices]
+
+    K = compute_kernel_matrix(X_test, X_sv, kernel)
+    decision = K @ (alpha_sv * y_sv) + b
+    return decision
+
+
+class OneVsAllSVM:
+    def __init__(self, kernel, C=1.0):
+        self.kernel = kernel
+        self.C = C
+        self.models_ = {}
+        self.classes_ = None
+        self.X_train_ = None
+        self.y_train_bin_ = {}
+
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        self.X_train_ = X.copy()
+        for cls in self.classes_:
+            y_bin = np.where(y == cls, 1, -1).astype(float)
+            alpha, sv_idx, b, obj, n_iter, status, opt_time = train_svm_dual_cvxopt(
+                X, y_bin, self.kernel, C=self.C
+            )
+            self.models_[cls] = (alpha, sv_idx, b)
+            self.y_train_bin_[cls] = y_bin
+
+    def decision_function(self, X):
+        scores = []
+        for cls in self.classes_:
+            alpha, sv_idx, b = self.models_[cls]
+            y_bin = self.y_train_bin_[cls]
+            dec = decision_function_svm_dual(self.X_train_, y_bin, X, alpha, b, self.kernel)
+            scores.append(dec)
+        return np.vstack(scores).T
+
+    def predict(self, X):
+        scores = self.decision_function(X)
+        idx = np.argmax(scores, axis=1)
+        return self.classes_[idx]
