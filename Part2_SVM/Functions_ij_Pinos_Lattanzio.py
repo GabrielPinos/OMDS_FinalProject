@@ -222,9 +222,122 @@ def evaluate_svm_all(X_train, y_train, X_test, y_test, alpha, b, kernel, thresho
     }
 
 
+# =========================
+# Q3: MVP / SMO-style (q=2)
+# =========================
+
+def svm_dual_objective(alpha, y, K):
+    """
+    W(alpha) = 1^T alpha - 1/2 alpha^T (Y K Y) alpha
+    (serve per riportare initial/final dual objective nel report)
+    """
+    Q = (y[:, None] * y[None, :]) * K
+    return float(np.sum(alpha) - 0.5 * alpha @ (Q @ alpha))
+
+
+def _compute_bias_from_free(alpha, y, K, C, tol=1e-6):
+    """
+    b = mean_i [ y_i - sum_j alpha_j y_j K_ij ] su SV liberi (0<alpha<C),
+    altrimenti media su tutti i SV.
+    """
+    f_no_b = K @ (alpha * y)
+    free = np.where((alpha > tol) & (alpha < C - tol))[0]
+    if free.size > 0:
+        return float(np.mean(y[free] - f_no_b[free]))
+    sv = np.where(alpha > tol)[0]
+    return float(np.mean(y[sv] - f_no_b[sv])) if sv.size > 0 else 0.0
+
+
+def train_svm_mvp(X, y, kernel, C=1.0, eps=1e-3, tol=1e-6,
+                  max_iter=100_000, verbose=False):
+    """
+    Most Violating Pair (q=2) — implementazione stile SMO.
+    Requisiti: y in {-1,+1}. Usa compute_kernel_matrix() e i kernel già presenti.
+
+    Ritorna: alpha, sv_idx, b, dual_obj_final, n_iter, status, opt_time
+             (stessa interfaccia della tua train_svm_dual_cvxopt)
+    """
+    y = y.astype(float)
+    n = X.shape[0]
+    K = compute_kernel_matrix(X, X, kernel)
+
+    alpha = np.zeros(n, dtype=float)
+
+    f_no_b = np.zeros(n, dtype=float)
+
+    t0 = time.perf_counter()
+    status = "max_iter_reached"
+    n_iter = 0
+
+    while n_iter < max_iter:
+
+        s = y - f_no_b
+
+
+        I_up  = np.where(((alpha < C - tol) & (y == +1)) | ((alpha > tol) & (y == -1)))[0]
+        I_low = np.where(((alpha < C - tol) & (y == -1)) | ((alpha > tol) & (y == +1)))[0]
+        if I_up.size == 0 or I_low.size == 0:
+            status = "optimal"
+            break
+
+        i = I_up[np.argmax(s[I_up])]
+        j = I_low[np.argmin(s[I_low])]
+        viol = s[i] - s[j]
+        if viol < eps:
+            status = "optimal"
+            break
+
+        yi, yj = y[i], y[j]
+        kii, kjj, kij = K[i, i], K[j, j], K[i, j]
+        eta = kii + kjj - 2.0 * kij
+        if eta <= 1e-12:
+            eta = 1e-12
+
+
+        Ei = f_no_b[i] - yi
+        Ej = f_no_b[j] - yj
+
+        ai_old, aj_old = alpha[i], alpha[j]
+        aj_new = aj_old + yj * (Ei - Ej) / eta
+
+        if yi != yj:
+            L = max(0.0, aj_old - ai_old)
+            H = min(C, C + aj_old - ai_old)
+        else:
+            L = max(0.0, ai_old + aj_old - C)
+            H = min(C, ai_old + aj_old)
+
+        aj_new = float(np.clip(aj_new, L, H))
+        if abs(aj_new - aj_old) < 1e-12 * (aj_new + aj_old + 1.0):
+            n_iter += 1
+            continue
+
+        ai_new = ai_old + yi * yj * (aj_old - aj_new)
+
+        dai = ai_new - ai_old
+        daj = aj_new - aj_old
+        f_no_b += (dai * yi) * K[:, i] + (daj * yj) * K[:, j]
+
+        alpha[i] = ai_new
+        alpha[j] = aj_new
+        n_iter += 1
+
+        if verbose and (n_iter % 1000 == 0):
+            print(f"[MVP] iter={n_iter:6d}  viol={viol:.3e}")
+
+    opt_time = time.perf_counter() - t0
+
+    b = _compute_bias_from_free(alpha, y, K, C, tol=tol)
+    dual_obj = svm_dual_objective(alpha, y, K)
+    sv_idx = np.where(alpha > tol)[0]
+
+    return alpha, sv_idx, b, dual_obj, n_iter, status, opt_time
 
 
 
+# =========================
+# Q4: Bonus: One-vs-All SVM
+# =========================
 def decision_function_svm_dual(X_train, y_train, X_test, alpha, b, kernel, tol=1e-5):
     """
     Restituisce i punteggi (decision values) del SVM binario:
@@ -239,15 +352,20 @@ def decision_function_svm_dual(X_train, y_train, X_test, alpha, b, kernel, tol=1
     decision = K @ (alpha_sv * y_sv) + b
     return decision
 
-
 class OneVsAllSVM:
     def __init__(self, kernel, C=1.0):
         self.kernel = kernel
         self.C = C
-        self.models_ = {}
+        self.models_ = {}        
         self.classes_ = None
         self.X_train_ = None
-        self.y_train_bin_ = {}
+        self.y_train_bin_ = {}     # cls -> y in {-1,+1}
+        self.stats_ = {            # per-class optimization stats
+            "iterations": {},      # cls -> int
+            "time": {},            # cls -> float seconds
+            "dual_obj": {},        # cls -> float
+            "status": {}           # cls -> str
+        }
 
     def fit(self, X, y):
         self.classes_ = np.unique(y)
@@ -259,6 +377,12 @@ class OneVsAllSVM:
             )
             self.models_[cls] = (alpha, sv_idx, b)
             self.y_train_bin_[cls] = y_bin
+            # save stats
+            self.stats_["iterations"][cls] = int(n_iter)
+            self.stats_["time"][cls] = float(opt_time)
+            self.stats_["dual_obj"][cls] = float(obj)
+            self.stats_["status"][cls] = str(status)
+        return self  # fluent
 
     def decision_function(self, X):
         scores = []
@@ -273,3 +397,10 @@ class OneVsAllSVM:
         scores = self.decision_function(X)
         idx = np.argmax(scores, axis=1)
         return self.classes_[idx]
+
+
+    def total_iterations(self):
+        return int(sum(self.stats_["iterations"].values()))
+
+    def total_time(self):
+        return float(sum(self.stats_["time"].values()))
